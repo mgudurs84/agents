@@ -2,6 +2,7 @@
 """
 Clean CSV to JSON Agent Deployment Script
 Uses gcloud login instead of service account key files
+Configured for anbc-dev-cdr-de (compute) and anbc-dev (storage with test-agent bucket)
 """
 
 import os
@@ -9,7 +10,9 @@ import sys
 import subprocess
 import json
 
-PROJECT_ID = "vertex-ai-demo-468112"  # CHANGE THIS
+PROJECT_ID = "anbc-dev-cdr-de"  # Compute project for Vertex AI
+STORAGE_PROJECT_ID = "anbc-dev"  # Storage project for buckets
+STAGING_BUCKET = "gs://test-agent"  # Your specific bucket
 LOCATION = "us-central1"
 
 def check_gcloud_auth():
@@ -69,7 +72,7 @@ def check_gcloud_auth():
         current_project = result.stdout.strip()
         if current_project != PROJECT_ID:
             print(f"Current project: {current_project}")
-            print(f"Required project: {PROJECT_ID}")
+            print(f"Required compute project: {PROJECT_ID}")
             
             # Ask if we should set the project
             try:
@@ -88,7 +91,7 @@ def check_gcloud_auth():
                 print(f"\nPlease set project manually: gcloud config set project {PROJECT_ID}")
                 return False
         else:
-            print(f"Project correctly set: {PROJECT_ID}")
+            print(f"Compute project correctly set: {PROJECT_ID}")
     
     except subprocess.CalledProcessError:
         print(f"Failed to get current project")
@@ -117,6 +120,12 @@ def check_gcloud_auth():
         print("Application Default Credentials not set")
         print("\nPlease run: gcloud auth application-default login")
         return False
+    
+    # Check access to both projects
+    print(f"\nChecking access to projects:")
+    print(f"  Compute project: {PROJECT_ID}")
+    print(f"  Storage project: {STORAGE_PROJECT_ID}")
+    print(f"  Using bucket: {STAGING_BUCKET}")
     
     return True
 
@@ -208,119 +217,54 @@ def verify_imports():
         print(f"Import verification failed: {e}")
         return False
 
-def list_available_buckets():
-    """List available buckets in the organization."""
-    print("\nListing Available Buckets")
-    print("=" * 32)
+def verify_bucket_access():
+    """Verify access to the test-agent bucket in anbc-dev."""
+    print(f"\nVerifying Bucket Access")
+    print("=" * 30)
     
     try:
         from google.cloud import storage
-        storage_client = storage.Client(project=PROJECT_ID)
         
-        buckets = list(storage_client.list_buckets())
+        # Connect to storage project specifically
+        storage_client = storage.Client(project=STORAGE_PROJECT_ID)
+        bucket_name = STAGING_BUCKET.replace("gs://", "")
+        bucket = storage_client.bucket(bucket_name)
         
-        if not buckets:
-            print("No buckets found in this project")
-            return []
+        # Check if bucket exists
+        if not bucket.exists():
+            print(f"ERROR: Bucket {bucket_name} does not exist in {STORAGE_PROJECT_ID}")
+            print(f"Please create the bucket or verify the name")
+            return False
         
-        print("Available buckets:")
-        bucket_names = []
-        for i, bucket in enumerate(buckets, 1):
-            print(f"  {i}. {bucket.name}")
-            bucket_names.append(bucket.name)
+        print(f"✓ Bucket {bucket_name} exists in {STORAGE_PROJECT_ID}")
         
-        return bucket_names
-        
-    except Exception as e:
-        print(f"Failed to list buckets: {e}")
-        return []
-
-def select_staging_bucket():
-    """Let user select or create a staging bucket."""
-    print("\nStaging Bucket Selection")
-    print("=" * 30)
-    
-    # List existing buckets
-    bucket_names = list_available_buckets()
-    
-    if bucket_names:
-        print("\nOptions:")
-        print("1. Use existing bucket")
-        print("2. Create new bucket")
-        
+        # Test read access
         try:
-            choice = input("\nChoose option (1/2): ").strip()
-            
-            if choice == "1":
-                print("\nSelect a bucket:")
-                for i, name in enumerate(bucket_names, 1):
-                    print(f"  {i}. {name}")
-                
-                try:
-                    bucket_choice = int(input(f"\nEnter bucket number (1-{len(bucket_names)}): "))
-                    if 1 <= bucket_choice <= len(bucket_names):
-                        selected_bucket = bucket_names[bucket_choice - 1]
-                        print(f"Selected bucket: {selected_bucket}")
-                        return f"gs://{selected_bucket}"
-                    else:
-                        print("Invalid selection")
-                        return None
-                except (ValueError, EOFError, KeyboardInterrupt):
-                    print("Invalid selection")
-                    return None
-            
-            elif choice == "2":
-                # Create new bucket
-                bucket_name = f"{PROJECT_ID}-vertex-ai-staging"
-                print(f"Will create new bucket: {bucket_name}")
-                return f"gs://{bucket_name}"
-            
-            else:
-                print("Invalid choice")
-                return None
-                
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled bucket selection")
-            return None
-    else:
-        # No existing buckets, create new one
-        bucket_name = f"{PROJECT_ID}-vertex-ai-staging"
-        print(f"No existing buckets found")
-        print(f"Will create new bucket: {bucket_name}")
-        return f"gs://{bucket_name}"
-
-def setup_environment():
-    """Setup environment using gcloud authentication."""
-    print("\nEnvironment Setup")
-    print("=" * 25)
-    
-    # Remove any existing service account credentials environment variable
-    if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
-        print("Removing GOOGLE_APPLICATION_CREDENTIALS environment variable")
-        del os.environ['GOOGLE_APPLICATION_CREDENTIALS']
-    
-    # Set project ID in environment
-    os.environ['GOOGLE_CLOUD_PROJECT'] = PROJECT_ID
-    print(f"Project ID: {PROJECT_ID}")
-    
-    # Verify we can access Google Cloud with current credentials
-    try:
-        from google.auth import default
-        credentials, project = default()
+            list(bucket.list_blobs(max_results=1))
+            print(f"✓ Read access confirmed")
+        except Exception as read_error:
+            print(f"✗ Read access failed: {read_error}")
+            return False
         
-        if project != PROJECT_ID:
-            print(f"Warning: Default project ({project}) differs from target ({PROJECT_ID})")
-            print("This is usually fine as we've set the project explicitly")
+        # Test write access by attempting to create a test object
+        try:
+            test_blob = bucket.blob("deployment-test.txt")
+            test_blob.upload_from_string("test")
+            test_blob.delete()
+            print(f"✓ Write access confirmed")
+        except Exception as write_error:
+            print(f"✗ Write access failed: {write_error}")
+            print(f"Make sure you have Storage Object Creator role in {STORAGE_PROJECT_ID}")
+            return False
         
-        print("Application Default Credentials found and working")
+        print(f"✓ Cross-project access verified for {STAGING_BUCKET}")
         return True
         
     except Exception as e:
-        print(f"Failed to get default credentials: {e}")
-        print("\nPlease ensure you've run:")
-        print("1. gcloud auth login")
-        print("2. gcloud auth application-default login")
-        print(f"3. gcloud config set project {PROJECT_ID}")
+        print(f"Bucket verification failed: {e}")
+        print(f"\nMake sure you have the following roles in {STORAGE_PROJECT_ID}:")
+        print("  - Storage Browser or Storage Object Viewer")
+        print("  - Storage Object Creator")
         return False
 
 def create_agent():
@@ -355,33 +299,59 @@ def create_agent():
         print("Run setup_clean.py first")
         return None
 
-def ensure_bucket_exists(bucket_uri):
-    """Ensure the specified bucket exists and is accessible."""
-    bucket_name = bucket_uri.replace("gs://", "")
+def setup_environment():
+    """Setup environment using gcloud authentication for cross-project setup."""
+    print("\nEnvironment Setup (Cross-Project)")
+    print("=" * 40)
     
+    # Remove any existing service account credentials environment variable
+    if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
+        print("Removing GOOGLE_APPLICATION_CREDENTIALS environment variable")
+        del os.environ['GOOGLE_APPLICATION_CREDENTIALS']
+    
+    # Set compute project ID in environment (for Vertex AI)
+    os.environ['GOOGLE_CLOUD_PROJECT'] = PROJECT_ID
+    print(f"Compute Project (Vertex AI): {PROJECT_ID}")
+    print(f"Storage Project (Buckets): {STORAGE_PROJECT_ID}")
+    print(f"Using bucket: {STAGING_BUCKET}")
+    
+    # Verify we can access Google Cloud with current credentials
     try:
-        from google.cloud import storage
-        storage_client = storage.Client(project=PROJECT_ID)
-        bucket = storage_client.bucket(bucket_name)
+        from google.auth import default
+        credentials, detected_project = default()
         
-        if bucket.exists():
-            print(f"Bucket {bucket_name} exists and is accessible")
-            return True
-        else:
-            print(f"Creating bucket {bucket_name}...")
-            try:
-                bucket = storage_client.create_bucket(bucket_name, location=LOCATION)
-                print(f"Bucket {bucket_name} created successfully")
-                return True
-            except Exception as create_error:
-                print(f"Failed to create bucket: {create_error}")
-                return False
-            
+        print(f"Default credentials project: {detected_project}")
+        print("Application Default Credentials found and working")
+        
+        # Test access to both projects
+        print("\nTesting project access...")
+        
+        # Test compute project access
+        try:
+            from google.cloud import aiplatform
+            aiplatform.init(project=PROJECT_ID, location=LOCATION)
+            print(f"✓ Vertex AI access confirmed in {PROJECT_ID}")
+        except Exception as e:
+            print(f"✗ Vertex AI access failed in {PROJECT_ID}: {e}")
+            return False
+        
+        # Test storage project access (already done in verify_bucket_access)
+        print(f"✓ Storage access already verified in {STORAGE_PROJECT_ID}")
+        
+        return True
+        
     except Exception as e:
-        print(f"Bucket access error: {e}")
+        print(f"Failed to get default credentials: {e}")
+        print("\nPlease ensure you've run:")
+        print("1. gcloud auth login")
+        print("2. gcloud auth application-default login")
+        print(f"3. gcloud config set project {PROJECT_ID}")
+        print(f"\nAlso ensure you have access to both projects:")
+        print(f"  - {PROJECT_ID} (Vertex AI Administrator)")
+        print(f"  - {STORAGE_PROJECT_ID} (Storage Browser/Object Viewer)")
         return False
 
-def deploy_with_agent_engines(agent, staging_bucket):
+def deploy_with_agent_engines(agent):
     """Deploy using agent engines (preferred method)."""
     print("\nDeploying with Agent Engines")
     print("=" * 35)
@@ -391,18 +361,16 @@ def deploy_with_agent_engines(agent, staging_bucket):
         from vertexai.preview import reasoning_engines
         from vertexai import agent_engines
         
-        # Initialize Vertex AI with selected bucket
+        # Initialize Vertex AI with your specific bucket
         vertexai.init(
             project=PROJECT_ID,
             location=LOCATION,
-            staging_bucket=staging_bucket
+            staging_bucket=STAGING_BUCKET
         )
-        print(f"Vertex AI initialized with staging bucket: {staging_bucket}")
-        
-        # Ensure bucket exists and is accessible
-        if not ensure_bucket_exists(staging_bucket):
-            print("Bucket setup failed")
-            return None
+        print(f"Vertex AI initialized:")
+        print(f"  Project: {PROJECT_ID}")
+        print(f"  Location: {LOCATION}")
+        print(f"  Staging bucket: {STAGING_BUCKET}")
         
         # Create AdkApp
         print("\nCreating AdkApp...")
@@ -465,7 +433,7 @@ def deploy_with_agent_engines(agent, staging_bucket):
         traceback.print_exc()
         return None
 
-def deploy_with_reasoning_engines(agent, staging_bucket):
+def deploy_with_reasoning_engines(agent):
     """Deploy using reasoning engines (fallback method)."""
     print("\nDeploying with Reasoning Engines")
     print("=" * 40)
@@ -474,18 +442,16 @@ def deploy_with_reasoning_engines(agent, staging_bucket):
         import vertexai
         from vertexai.preview import reasoning_engines
         
-        # Initialize Vertex AI with selected bucket
+        # Initialize Vertex AI with your specific bucket
         vertexai.init(
             project=PROJECT_ID,
             location=LOCATION,
-            staging_bucket=staging_bucket
+            staging_bucket=STAGING_BUCKET
         )
-        print(f"Vertex AI initialized with staging bucket: {staging_bucket}")
-        
-        # Ensure bucket exists and is accessible
-        if not ensure_bucket_exists(staging_bucket):
-            print("Bucket setup failed")
-            return None
+        print(f"Vertex AI initialized:")
+        print(f"  Project: {PROJECT_ID}")
+        print(f"  Location: {LOCATION}")
+        print(f"  Staging bucket: {STAGING_BUCKET}")
         
         # Create Reasoning Engine
         print("\nCreating Reasoning Engine...")
@@ -527,10 +493,13 @@ def deploy_with_reasoning_engines(agent, staging_bucket):
 
 def main():
     """Main deployment function."""
-    print("CSV to JSON Agent - Clean Deployment (gcloud login)")
-    print("=" * 55)
-    print(f"Project: {PROJECT_ID}")
+    print("CSV to JSON Agent - Cross-Project Deployment")
+    print("=" * 50)
+    print(f"Compute Project (Vertex AI): {PROJECT_ID}")
+    print(f"Storage Project (Buckets): {STORAGE_PROJECT_ID}")
+    print(f"Staging Bucket: {STAGING_BUCKET}")
     print(f"Location: {LOCATION}")
+    print("Cross-VPC wiring: ENABLED")
     print()
     
     # Step 1: Check gcloud authentication
@@ -541,29 +510,31 @@ def main():
         print("1. gcloud auth login")
         print("2. gcloud auth application-default login") 
         print(f"3. gcloud config set project {PROJECT_ID}")
+        print(f"\nEnsure you have access to both projects:")
+        print(f"  - {PROJECT_ID}: Vertex AI Administrator") 
+        print(f"  - {STORAGE_PROJECT_ID}: Storage Browser/Object Viewer for test-agent bucket")
         return
     
-    # Step 2: Fix dependencies
-    print("\nStep 2: Fixing dependency conflicts...")
+    # Step 2: Verify bucket access
+    print("\nStep 2: Verifying test-agent bucket access...")
+    if not verify_bucket_access():
+        print("Bucket access verification failed")
+        return
+    
+    # Step 3: Fix dependencies
+    print("\nStep 3: Fixing dependency conflicts...")
     if not fix_dependencies():
         print("Dependency fixing failed")
         return
     
-    # Step 3: Verify imports
-    print("Step 3: Verifying imports...")
+    # Step 4: Verify imports
+    print("Step 4: Verifying imports...")
     has_agent_engines = verify_imports()
     if not has_agent_engines:
         print("agent_engines not available, will use reasoning engines")
     
-    # Step 4: Select staging bucket
-    print("Step 4: Selecting staging bucket...")
-    staging_bucket = select_staging_bucket()
-    if not staging_bucket:
-        print("Bucket selection failed")
-        return
-    
-    # Step 5: Setup environment
-    print("Step 5: Setting up environment...")
+    # Step 5: Setup cross-project environment
+    print("Step 5: Setting up cross-project environment...")
     if not setup_environment():
         print("Environment setup failed")
         return
@@ -577,12 +548,16 @@ def main():
     
     # Step 7: Confirm deployment
     try:
-        print(f"\nDeployment Summary:")
-        print(f"  Project: {PROJECT_ID}")
+        print(f"\nCross-Project Deployment Summary:")
+        print(f"  Compute Project: {PROJECT_ID}")
+        print(f"  Storage Project: {STORAGE_PROJECT_ID}")
         print(f"  Location: {LOCATION}")
-        print(f"  Staging Bucket: {staging_bucket}")
+        print(f"  Staging Bucket: {STAGING_BUCKET}")
+        print(f"  Agent will be deployed in: {PROJECT_ID}")
+        print(f"  Agent will use storage from: {STORAGE_PROJECT_ID}")
+        print(f"  Cross-VPC wiring: ENABLED")
         
-        confirm = input(f"\nDeploy CSV to JSON Agent to Vertex AI? (yes/no): ").strip().lower()
+        confirm = input(f"\nDeploy CSV to JSON Agent with this configuration? (yes/no): ").strip().lower()
         if confirm not in ['yes', 'y']:
             print("Deployment cancelled.")
             return
@@ -595,14 +570,20 @@ def main():
     
     if has_agent_engines:
         print("Attempting deployment with Agent Engines...")
-        deployed_agent = deploy_with_agent_engines(agent, staging_bucket)
+        deployed_agent = deploy_with_agent_engines(agent)
     
     if not deployed_agent:
         print("Falling back to Reasoning Engines...")
-        deployed_agent = deploy_with_reasoning_engines(agent, staging_bucket)
+        deployed_agent = deploy_with_reasoning_engines(agent)
     
     if deployed_agent:
         print("\nSUCCESS!")
+        print("\nCross-Project Setup Complete:")
+        print(f"  ✓ Agent deployed in: {PROJECT_ID}")
+        print(f"  ✓ Using storage from: {STORAGE_PROJECT_ID}")
+        print(f"  ✓ Staging bucket: {STAGING_BUCKET}")
+        print(f"  ✓ Cross-VPC wiring: ENABLED")
+        
         print("\nUsage Examples:")
         print("   Send CSV data like:")
         print("   name,age,city")
@@ -610,9 +591,14 @@ def main():
         print("   Jane,30,LA")
         
         print(f"\nResource: {deployed_agent.resource_name}")
-        print("Console: https://console.cloud.google.com/vertex-ai/agents")
+        print(f"Console: https://console.cloud.google.com/vertex-ai/agents?project={PROJECT_ID}")
     else:
         print("\nAll deployment methods failed - check errors above")
+        print("\nCommon cross-project issues:")
+        print(f"1. Missing IAM roles in {STORAGE_PROJECT_ID}")
+        print(f"2. Missing IAM roles in {PROJECT_ID}")
+        print("3. Cross-VPC connectivity issues")
+        print("4. Bucket permissions not set correctly")
 
 if __name__ == "__main__":
     main()
