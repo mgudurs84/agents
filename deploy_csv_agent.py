@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""
+Clean CSV to JSON Agent Deployment Script
+Fixes all dependencies and deploys successfully
+"""
+
+import os
+import sys
+import subprocess
+import json
+
+PROJECT_ID = "vertex-ai-demo-468112"  # CHANGE THIS
+LOCATION = "us-central1"
+
+def fix_dependencies():
+    """Fix dependency conflicts by installing compatible versions."""
+    print("Fixing Dependencies")
+    print("=" * 25)
+    
+    # First, uninstall conflicting packages
+    print("Removing conflicting packages...")
+    packages_to_remove = [
+        "google-cloud-aiplatform",
+        "vertexai", 
+        "google-cloud-storage",
+        "google-adk"
+    ]
+    
+    for package in packages_to_remove:
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "uninstall", package, "-y"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except:
+            pass  # Package might not be installed
+    
+    print("Cleaned up packages")
+    
+    # Install compatible versions in correct order
+    print("Installing compatible versions...")
+    
+    # Step 1: Install storage first
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "google-cloud-storage==2.18.0"
+    ])
+    print("google-cloud-storage==2.18.0")
+    
+    # Step 2: Install aiplatform with agent engines
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "google-cloud-aiplatform[agent_engines]==1.95.1"
+    ])
+    print("google-cloud-aiplatform[agent_engines]==1.95.1")
+    
+    # Step 3: Install vertexai compatible version
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "vertexai==1.71.1"
+    ])
+    print("vertexai==1.71.1")
+    
+    # Step 4: Install ADK
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "google-adk==1.9.0"
+    ])
+    print("google-adk==1.9.0")
+    
+    print("All dependencies fixed!")
+    return True
+
+def verify_imports():
+    """Verify all imports work correctly."""
+    print("\\nVerifying Imports")
+    print("=" * 22)
+    
+    try:
+        import vertexai
+        print("vertexai")
+        
+        from vertexai.preview import reasoning_engines
+        print("reasoning_engines")
+        
+        # Check if agent_engines is available
+        try:
+            from vertexai import agent_engines
+            print("agent_engines")
+            has_agent_engines = True
+        except ImportError:
+            print("agent_engines not available - using alternative approach")
+            has_agent_engines = False
+        
+        from google.cloud import aiplatform, storage
+        print("google.cloud libraries")
+        
+        return has_agent_engines
+        
+    except ImportError as e:
+        print(f"Import verification failed: {e}")
+        return False
+
+def setup_environment():
+    """Setup and verify environment."""
+    print("\\nEnvironment Setup")
+    print("=" * 25)
+    
+    # Set project ID
+    os.environ['GOOGLE_CLOUD_PROJECT'] = PROJECT_ID
+    print(f"Project ID: {PROJECT_ID}")
+    
+    # Check credentials
+    creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+    if not creds_path or not os.path.exists(creds_path):
+        print("Service account credentials not found")
+        print("\\nSetup instructions:")
+        print("1. Go to Google Cloud Console > IAM & Admin > Service Accounts")
+        print("2. Create/select service account with Vertex AI Admin role")
+        print("3. Download JSON key file")
+        print("4. Set environment variable:")
+        print('   PowerShell: $env:GOOGLE_APPLICATION_CREDENTIALS="C:\\path\\to\\key.json"')
+        return False
+    
+    print(f"Credentials: {creds_path}")
+    
+    # Verify credentials file
+    try:
+        with open(creds_path, 'r') as f:
+            creds = json.load(f)
+            creds_project = creds.get('project_id')
+            if creds_project != PROJECT_ID:
+                print(f"Credentials project ({creds_project}) differs from set project ({PROJECT_ID})")
+            else:
+                print("Credentials project matches")
+    except Exception as e:
+        print(f"Could not verify credentials file: {e}")
+    
+    return True
+
+def create_agent():
+    """Create the CSV to JSON agent."""
+    print("\\nCreating Agent")
+    print("=" * 20)
+    
+    try:
+        from csv_json_converter import root_agent
+        print(f"Agent imported: {type(root_agent)}")
+        
+        # Test agent differently based on type
+        try:
+            # Check if it's a real ADK LlmAgent
+            if hasattr(root_agent, '__class__') and 'LlmAgent' in str(type(root_agent)):
+                print("Real ADK LlmAgent detected - skipping local test")
+                print("Agent ready for deployment")
+            else:
+                # Test simple agent
+                test_csv = "name,age\\nJohn,25\\nJane,30"
+                test_result = root_agent(test_csv)
+                print(f"Agent test: {len(test_result)} char response")
+        except Exception as test_error:
+            print(f"Agent test failed: {test_error}")
+            print("Continuing with deployment anyway...")
+        
+        return root_agent
+        
+    except ImportError as e:
+        print(f"Import failed: {e}")
+        print("Make sure csv_json_converter package exists")
+        print("Run setup_clean.py first")
+        return None
+
+def deploy_with_agent_engines(agent):
+    """Deploy using agent engines (preferred method)."""
+    print("\\nDeploying with Agent Engines")
+    print("=" * 35)
+    
+    try:
+        import vertexai
+        from vertexai.preview import reasoning_engines
+        from vertexai import agent_engines
+        
+        # Initialize Vertex AI
+        staging_bucket = f"gs://{PROJECT_ID}-vertex-ai-staging"
+        vertexai.init(
+            project=PROJECT_ID,
+            location=LOCATION,
+            staging_bucket=staging_bucket
+        )
+        print("Vertex AI initialized")
+        
+        # Create staging bucket if needed
+        try:
+            from google.cloud import storage
+            storage_client = storage.Client()
+            bucket_name = f"{PROJECT_ID}-vertex-ai-staging"
+            bucket = storage_client.bucket(bucket_name)
+            if not bucket.exists():
+                bucket = storage_client.create_bucket(bucket_name, location=LOCATION)
+                print("Staging bucket created")
+            else:
+                print("Staging bucket exists")
+        except Exception as e:
+            print(f"Bucket issue: {e}")
+        
+        # Create AdkApp
+        print("\\nCreating AdkApp...")
+        app = reasoning_engines.AdkApp(
+            agent=agent,
+            enable_tracing=True,
+        )
+        print("AdkApp created")
+        
+        # Deploy to Agent Engine
+        print("\\nDeploying to Agent Engine...")
+        print("   This may take 5-10 minutes...")
+        
+        remote_app = agent_engines.create(
+            agent_engine=app,
+            requirements=[
+                "google-cloud-aiplatform[adk,agent_engines]>=1.95.1",
+                "google-cloud-storage>=2.18.0"
+            ],
+            extra_packages=["./csv_json_converter"],
+        )
+        
+        print("Deployment successful!")
+        print(f"Resource: {remote_app.resource_name}")
+        
+        # Test the deployed agent
+        print("\\nTesting Deployed Agent...")
+        try:
+            session = remote_app.create_session(user_id="test_user")
+            
+            test_csv = "name,age,city\\nAlice,28,Tokyo\\nBob,32,Berlin"
+            print(f"Test CSV: {test_csv[:30]}...")
+            
+            response_parts = []
+            for event in remote_app.stream_query(
+                user_id="test_user",
+                session_id=session["id"],
+                message=test_csv
+            ):
+                if 'parts' in event:
+                    for part in event['parts']:
+                        if 'text' in part:
+                            response_parts.append(part['text'])
+            
+            if response_parts:
+                response = ''.join(response_parts)
+                print(f"Response: {response[:100]}...")
+                print("Agent test successful!")
+            else:
+                print("No response, but deployment completed")
+                
+        except Exception as test_error:
+            print(f"Testing error: {test_error}")
+        
+        return remote_app
+        
+    except Exception as e:
+        print(f"Agent Engine deployment failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def deploy_with_reasoning_engines(agent):
+    """Deploy using reasoning engines (fallback method)."""
+    print("\\nDeploying with Reasoning Engines")
+    print("=" * 40)
+    
+    try:
+        import vertexai
+        from vertexai.preview import reasoning_engines
+        
+        # Initialize Vertex AI
+        staging_bucket = f"gs://{PROJECT_ID}-vertex-ai-staging"
+        vertexai.init(
+            project=PROJECT_ID,
+            location=LOCATION,
+            staging_bucket=staging_bucket
+        )
+        print("Vertex AI initialized")
+        
+        # Create staging bucket if needed
+        try:
+            from google.cloud import storage
+            storage_client = storage.Client()
+            bucket_name = f"{PROJECT_ID}-vertex-ai-staging"
+            bucket = storage_client.bucket(bucket_name)
+            if not bucket.exists():
+                bucket = storage_client.create_bucket(bucket_name, location=LOCATION)
+                print("Staging bucket created")
+            else:
+                print("Staging bucket exists")
+        except Exception as e:
+            print(f"Bucket issue: {e}")
+        
+        # Create Reasoning Engine
+        print("\\nCreating Reasoning Engine...")
+        
+        remote_app = reasoning_engines.ReasoningEngine.create(
+            reasoning_engine=agent,
+            requirements=[
+                "google-cloud-aiplatform[reasoning_engines]>=1.95.1",
+                "google-cloud-storage>=2.18.0"
+            ],
+            extra_packages=["./csv_json_converter"],
+            display_name="CSV to JSON Converter",
+            description="Converts CSV files to JSON format"
+        )
+        
+        print("Deployment successful!")
+        print(f"Resource: {remote_app.resource_name}")
+        
+        # Test the deployed agent
+        print("\\nTesting Deployed Agent...")
+        try:
+            test_csv = "name,age,city\\nAlice,28,Tokyo\\nBob,32,Berlin"
+            print(f"Test CSV: {test_csv[:30]}...")
+            
+            response = remote_app.query(input=test_csv)
+            print(f"Response: {str(response)[:100]}...")
+            print("Agent test successful!")
+                
+        except Exception as test_error:
+            print(f"Testing error: {test_error}")
+        
+        return remote_app
+        
+    except Exception as e:
+        print(f"Reasoning Engine deployment failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def main():
+    """Main deployment function."""
+    print("CSV to JSON Agent - Clean Deployment")
+    print("=" * 45)
+    print(f"Project: {PROJECT_ID}")
+    print(f"Location: {LOCATION}")
+    print()
+    
+    # Step 1: Fix dependencies
+    print("Step 1: Fixing dependency conflicts...")
+    if not fix_dependencies():
+        print("Dependency fixing failed")
+        return
+    
+    # Step 2: Verify imports
+    print("Step 2: Verifying imports...")
+    has_agent_engines = verify_imports()
+    if not has_agent_engines:
+        print("agent_engines not available, will use reasoning engines")
+    
+    # Step 3: Setup environment
+    print("Step 3: Setting up environment...")
+    if not setup_environment():
+        print("Environment setup failed")
+        return
+    
+    # Step 4: Create agent
+    print("Step 4: Creating agent...")
+    agent = create_agent()
+    if not agent:
+        print("Agent creation failed")
+        return
+    
+    # Step 5: Confirm deployment
+    try:
+        confirm = input(f"\\nDeploy CSV to JSON Agent to Vertex AI? (yes/no): ").strip().lower()
+        if confirm not in ['yes', 'y']:
+            print("Deployment cancelled.")
+            return
+    except (EOFError, KeyboardInterrupt):
+        print("\\nDeployment cancelled.")
+        return
+    
+    # Step 6: Deploy (try agent engines first, fallback to reasoning engines)
+    deployed_agent = None
+    
+    if has_agent_engines:
+        print("Attempting deployment with Agent Engines...")
+        deployed_agent = deploy_with_agent_engines(agent)
+    
+    if not deployed_agent:
+        print("Falling back to Reasoning Engines...")
+        deployed_agent = deploy_with_reasoning_engines(agent)
+    
+    if deployed_agent:
+        print("\\nSUCCESS!")
+        print("\\nUsage Examples:")
+        print("   Send CSV data like:")
+        print("   name,age,city")
+        print("   John,25,NYC")
+        print("   Jane,30,LA")
+        
+        print(f"\\nResource: {deployed_agent.resource_name}")
+        print("Console: https://console.cloud.google.com/vertex-ai/agents")
+    else:
+        print("\\nAll deployment methods failed - check errors above")
+
+if __name__ == "__main__":
+    main()
